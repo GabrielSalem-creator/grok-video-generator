@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { RateLimitError, runFullVideoGeneration } from "@/lib/video-api";
 
+export const maxDuration = 300;
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -14,12 +16,11 @@ export async function POST(request: Request) {
       );
     }
 
-    const { id, videoUrl } = await runFullVideoGeneration(
-      prompt.trim(),
+    const { id, videoUrl } = await runFullVideoGeneration({
+      prompt: prompt.trim(),
       aspectRatio,
-      false,
-      "[video]"
-    );
+      logPrefix: "[faceai]",
+    });
 
     return NextResponse.json({ id, videoUrl });
   } catch (error) {
