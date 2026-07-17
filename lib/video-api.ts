@@ -1,216 +1,332 @@
-const BASE_URL = "https://veoaifree.com";
-export const AJAX_ENDPOINT = `${BASE_URL}/wp-admin/admin-ajax.php`;
-export const VIDEO_BASE = `${BASE_URL}/video/uploads`;
+const API_URL = "https://api.apivondy.com/api/open/video/generate";
 
-export const MAX_WAIT = 300;
+const MAX_RETRIES = 5;
+const RETRY_DELAY_SEC = 2;
+const REQUEST_TIMEOUT_MS = 30_000;
 
-const CHROME_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+type ApiJson = Record<string, unknown>;
 
-/** Same idea as Python: browser-like GET to HTML pages, then reuse cookies on AJAX POST. */
-const HTML_FETCH_HEADERS: Record<string, string> = {
-  "User-Agent": CHROME_UA,
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept-Encoding": "gzip, deflate, br",
-  DNT: "1",
-  Connection: "keep-alive",
-  "Upgrade-Insecure-Requests": "1",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1",
-  "Cache-Control": "max-age=0",
-};
-
-const NONCE_PATTERNS: RegExp[] = [
-  /nonce["']?\s*[:=]\s*["']([^"']+)["']/,
-  /"nonce":"([^"]+)"/,
-  /nonce['"]([^'"]+)['"]/,
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
 ];
 
-function getSetCookieList(headers: Headers): string[] {
-  const h = headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof h.getSetCookie === "function") {
-    return h.getSetCookie();
+export class RateLimitError extends Error {
+  readonly status = 429;
+  constructor(message: string) {
+    super(message);
+    this.name = "RateLimitError";
   }
-  const single = headers.get("set-cookie");
-  return single ? [single] : [];
 }
 
-/** Merge Set-Cookie lines into a single Cookie request header (name=value pairs only). */
-function mergeCookiesFromSetCookie(
-  existingCookieHeader: string,
-  setCookieHeaders: string[]
-): string {
-  const map = new Map<string, string>();
-  for (const part of existingCookieHeader.split(";")) {
-    const p = part.trim();
-    if (!p.includes("=")) continue;
-    const i = p.indexOf("=");
-    map.set(p.slice(0, i).trim(), p.slice(i + 1).trim());
-  }
-  for (const sc of setCookieHeaders) {
-    const pair = sc.split(";")[0]?.trim();
-    if (!pair?.includes("=")) continue;
-    const i = pair.indexOf("=");
-    map.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
-  }
-  return [...map.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+function pickRandom<T>(arr: readonly T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)]!;
 }
 
-export async function extractNonceAndCookies(): Promise<{
-  nonce: string;
-  cookieHeader: string;
-}> {
-  let cookieJar = "";
-  const pages = ["veo-video-generator/", "grok-ai-video-generator/"] as const;
+function getProxyList(): string[] {
+  const raw = process.env.PROXY_LIST ?? "";
+  return raw
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+}
 
-  for (const page of pages) {
-    const url = `${BASE_URL}/${page}`;
-    let res: Response;
-    try {
-      res = await fetch(url, {
-        method: "GET",
-        headers: {
-          ...HTML_FETCH_HEADERS,
-          ...(cookieJar ? { Cookie: cookieJar } : {}),
-        },
-        redirect: "follow",
-        cache: "no-store",
-      });
-    } catch (e) {
-      console.warn("[veo] GET failed:", page, e);
-      continue;
-    }
+function getProxyForAttempt(attempt: number): string | undefined {
+  const list = getProxyList();
+  if (!list.length) return undefined;
+  return list[(attempt - 1) % list.length];
+}
 
-    if (!res.ok) {
-      console.warn("[veo] GET", page, "status", res.status);
-      continue;
-    }
-
-    const setCookies = getSetCookieList(res.headers);
-    cookieJar = mergeCookiesFromSetCookie(cookieJar, setCookies);
-    const text = await res.text();
-
-    for (const pattern of NONCE_PATTERNS) {
-      const m = text.match(pattern);
-      if (m?.[1]) {
-        return { nonce: m[1], cookieHeader: cookieJar };
-      }
-    }
+function getSecChUaFromUa(ua: string): string {
+  if (ua.includes("Firefox")) {
+    return '"Firefox";v="135", "Not.A/Brand";v="8"';
   }
+  if (ua.includes("Safari") && !ua.includes("Chrome")) {
+    return '"Safari";v="18", "Not.A/Brand";v="8"';
+  }
+  const match = ua.match(/Chrome\/(\d+)/);
+  const version = match?.[1] ?? "147";
+  return `"Google Chrome";v="${version}", "Not.A/Brand";v="8", "Chromium";v="${version}"`;
+}
 
-  throw new Error(
-    "Could not extract API nonce from veoaifree.com (pages may have changed or the site is unreachable)."
+function getPlatformFromUa(ua: string): string {
+  if (ua.includes("Windows")) return '"Windows"';
+  if (ua.includes("Mac")) return '"macOS"';
+  if (ua.includes("Linux")) return '"Linux"';
+  return '"Unknown"';
+}
+
+function getRandomDeviceId(): string {
+  const hex = () => crypto.randomUUID().replace(/-/g, "");
+  return [
+    hex().slice(0, 16),
+    hex().slice(0, 14),
+    Date.now().toString(16),
+    Math.floor(Math.random() * 0xffffffff).toString(16),
+  ].join("-");
+}
+
+export function normalizeAspectRatio(aspectRatio: string): string {
+  const map: Record<string, string> = {
+    "16:9": "16:9",
+    "9:16": "9:16",
+    "1:1": "1:1",
+    "4:3": "16:9",
+    "3:4": "9:16",
+  };
+  return map[aspectRatio] ?? "16:9";
+}
+
+function isHttpUrl(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    (value.startsWith("http://") || value.startsWith("https://"))
   );
 }
 
-export function getAspectRatioValue(aspectRatio: string): string {
-  const mapping: Record<string, string> = {
-    "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-    "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
-    "1:1": "VIDEO_ASPECT_RATIO_SQUARE",
-    "2:3": "VIDEO_ASPECT_RATIO_PORTRAIT",
-    "3:2": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-    "4:3": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-    "3:4": "VIDEO_ASPECT_RATIO_PORTRAIT",
-  };
-  return mapping[aspectRatio] || "VIDEO_ASPECT_RATIO_LANDSCAPE";
+function getNested(obj: ApiJson, path: string): unknown {
+  let val: unknown = obj;
+  for (const part of path.split(".")) {
+    if (!val || typeof val !== "object") return undefined;
+    val = (val as ApiJson)[part];
+  }
+  return val;
 }
 
-/** Anti-403 AJAX POST: same fields as Python + origin / sec-fetch / session cookies. */
-export async function submitPrompt(
+function extractVideoUrl(responseData: ApiJson): string | null {
+  const keys = ["url", "resultUrl", "videoUrl", "data.url", "video_url"];
+
+  for (const key of keys) {
+    const val = key.includes(".")
+      ? getNested(responseData, key)
+      : responseData[key];
+    if (isHttpUrl(val)) return val;
+  }
+
+  for (const value of Object.values(responseData)) {
+    if (
+      isHttpUrl(value) &&
+      (value.includes(".mp4") || value.includes("video"))
+    ) {
+      return value;
+    }
+  }
+
+  const data = responseData.data;
+  if (data && typeof data === "object" && data !== null) {
+    for (const value of Object.values(data as ApiJson)) {
+      if (isHttpUrl(value)) return value;
+    }
+  }
+
+  return null;
+}
+
+function extractId(responseData: ApiJson): string {
+  for (const key of ["id", "taskId", "task_id", "jobId", "job_id"]) {
+    const val = responseData[key];
+    if (typeof val === "string" && val) return val;
+  }
+  return crypto.randomUUID();
+}
+
+async function fetchWithOptionalProxy(
+  url: string,
+  init: RequestInit,
+  attempt: number
+): Promise<Response> {
+  const proxyUrl = getProxyForAttempt(attempt);
+  if (proxyUrl) {
+    try {
+      const { ProxyAgent, fetch: undiciFetch } = await import("undici");
+      const agent = new ProxyAgent(proxyUrl);
+      return (await undiciFetch(url, {
+        ...init,
+        dispatcher: agent,
+      })) as unknown as Response;
+    } catch (e) {
+      console.warn("[video] Proxy request failed, using direct fetch:", e);
+    }
+  }
+  return fetch(url, init);
+}
+
+type SessionResult =
+  | { ok: true; videoUrl: string; data: ApiJson }
+  | { ok: false; rateLimited: boolean; error: string; data: ApiJson | null };
+
+async function generateVideoWithSession(
   prompt: string,
   aspectRatio: string,
-  nonce: string,
-  cookieHeader: string
-): Promise<string> {
-  const formData = new URLSearchParams();
-  formData.append("action", "veo_video_generator");
-  formData.append("nonce", nonce);
-  formData.append("prompt", prompt);
-  formData.append("totalVariations", "1");
-  formData.append("aspectRatio", getAspectRatioValue(aspectRatio));
-  formData.append("actionType", "full-video-generate");
+  attempt: number,
+  logPrefix: string
+): Promise<SessionResult> {
+  const ua = pickRandom(USER_AGENTS);
+  const deviceId = getRandomDeviceId();
+  const proxyUrl = getProxyForAttempt(attempt);
 
-  const response = await fetch(AJAX_ENDPOINT, {
-    method: "POST",
-    headers: {
-      accept: "*/*",
-      "accept-language": "en-US,en;q=0.9",
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "x-requested-with": "XMLHttpRequest",
-      referer: `${BASE_URL}/grok-ai-video-generator/`,
-      origin: BASE_URL,
-      "sec-fetch-dest": "empty",
-      "sec-fetch-mode": "cors",
-      "sec-fetch-site": "same-origin",
-      priority: "u=1, i",
-      "User-Agent": CHROME_UA,
-      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-    },
-    body: formData.toString(),
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": ua,
+    "sec-ch-ua": getSecChUaFromUa(ua),
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": getPlatformFromUa(ua),
+    "x-vondy-tier": "lite",
+    "x-device-id": deviceId,
+    Referer: "https://vondy.com/",
+    Origin: "https://vondy.com",
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+  };
+
+  const payload = {
+    prompt,
+    duration: "5",
+    aspectRatio,
+    resolution: "720p",
+    cameraFixed: false,
+  };
+
+  console.log(logPrefix, `Attempt ${attempt}`, {
+    ua: ua.slice(0, 50) + "…",
+    deviceId,
+    proxy: proxyUrl ?? "none",
   });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(
-      `Failed to submit prompt: ${response.status}${text ? ` — ${text.slice(0, 200)}` : ""}`
-    );
-  }
+  const controller = new AbortController();
+  const tid = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  const sceneData = (await response.text()).trim();
-  if (!/^\d+$/.test(sceneData)) {
-    throw new Error(`Unexpected response: ${sceneData.slice(0, 200)}`);
-  }
-  return sceneData;
-}
-
-export async function findVideoUrl(
-  sceneData: string,
-  startTime: number,
-  logPrefix = "[video]"
-): Promise<string> {
-  for (let offset = 0; offset < MAX_WAIT; offset++) {
-    const timestamp = startTime + offset;
-    const url = `${VIDEO_BASE}/video_${sceneData}_${timestamp}.mp4`;
-
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 5000);
-    try {
-      const response = await fetch(url, {
-        method: "HEAD",
-        redirect: "follow",
+  try {
+    const response = await fetchWithOptionalProxy(
+      API_URL,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        cache: "no-store",
         signal: controller.signal,
-      });
-      if (response.ok) {
-        return url;
-      }
+      },
+      attempt
+    );
+
+    const text = await response.text();
+    let data: ApiJson;
+    try {
+      data = JSON.parse(text) as ApiJson;
     } catch {
-      // continue
-    } finally {
-      clearTimeout(tid);
+      data = { raw: text };
     }
 
-    if (offset > 0 && offset % 30 === 0) {
-      console.log(logPrefix, "Still searching… offset:", offset);
+    if (response.status === 429) {
+      const errMsg =
+        (typeof data.error === "string" && data.error) ||
+        (typeof data.message === "string" && data.message) ||
+        text.slice(0, 200);
+      return {
+        ok: false,
+        rateLimited: true,
+        error: `RATE_LIMITED: ${errMsg}`,
+        data,
+      };
     }
-    await new Promise((r) => setTimeout(r, 1000));
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        rateLimited: false,
+        error: `HTTP ${response.status}: ${text.slice(0, 200)}`,
+        data,
+      };
+    }
+
+    const videoUrl = extractVideoUrl(data);
+    if (!videoUrl) {
+      console.log(
+        logPrefix,
+        "No video URL in response:",
+        JSON.stringify(data).slice(0, 500)
+      );
+      return {
+        ok: false,
+        rateLimited: false,
+        error: "No video URL in response",
+        data,
+      };
+    }
+
+    return { ok: true, videoUrl, data };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      ok: false,
+      rateLimited: false,
+      error: `Network error: ${msg}`,
+      data: null,
+    };
+  } finally {
+    clearTimeout(tid);
   }
-  throw new Error("Video generation timed out. Please try again.");
 }
 
-/** Fresh nonce + cookies each run (no deploy / env nonce required). */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Vondy API with session rotation (matches generate_video.py). */
 export async function runFullVideoGeneration(
   prompt: string,
   aspectRatio: string,
+  _withAudio = false,
   logPrefix = "[video]"
 ): Promise<{ id: string; videoUrl: string }> {
-  const { nonce, cookieHeader } = await extractNonceAndCookies();
-  const sceneData = await submitPrompt(prompt.trim(), aspectRatio, nonce, cookieHeader);
-  const startTs = Math.floor(Date.now() / 1000);
-  const videoUrl = await findVideoUrl(sceneData, startTs, logPrefix);
-  return { id: sceneData, videoUrl };
+  const ratio = normalizeAspectRatio(aspectRatio);
+  let lastError = "Unknown error";
+
+  console.log(logPrefix, "Generating:", prompt.slice(0, 80));
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const result = await generateVideoWithSession(
+      prompt.trim(),
+      ratio,
+      attempt,
+      logPrefix
+    );
+
+    if (result.ok) {
+      console.log(logPrefix, "Success on attempt", attempt);
+      return {
+        id: extractId(result.data),
+        videoUrl: result.videoUrl,
+      };
+    }
+
+    lastError = result.error;
+    console.warn(logPrefix, "Attempt", attempt, "failed:", result.error);
+
+    if (result.rateLimited && attempt < MAX_RETRIES) {
+      const delay = RETRY_DELAY_SEC * attempt * 1000;
+      console.log(logPrefix, "Rate limited — retrying in", delay / 1000, "s…");
+      await sleep(delay);
+      continue;
+    }
+
+    if (!result.rateLimited) {
+      break;
+    }
+  }
+
+  if (lastError.includes("RATE_LIMITED")) {
+    throw new RateLimitError(
+      "Vondy rate limit reached after retries. Wait and try again, or set PROXY_LIST env for rotation."
+    );
+  }
+
+  throw new Error(`Failed after ${MAX_RETRIES} attempts. Last error: ${lastError}`);
 }
+
+// Back-compat alias used elsewhere
+export const normalizeSize = normalizeAspectRatio;

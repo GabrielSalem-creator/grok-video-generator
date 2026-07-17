@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { runFullVideoGeneration } from "@/lib/video-api";
+import { RateLimitError, runFullVideoGeneration } from "@/lib/video-api";
 
 export async function POST(request: Request) {
   try {
@@ -15,6 +15,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ id, videoUrl });
   } catch (error) {
     console.error("Error creating image-to-video:", error);
+    if (error instanceof RateLimitError) {
+      return NextResponse.json({ error: error.message }, { status: 429 });
+    }
     return NextResponse.json(
       { error: error instanceof Error ? error.message : "Internal server error" },
       { status: 500 }
