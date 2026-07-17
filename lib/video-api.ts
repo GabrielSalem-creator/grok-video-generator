@@ -6,10 +6,18 @@ const PRESIGNED_URL = "https://faceai.art/api/r2_presigned_url";
 const THEME_VERSION =
   "83EmcUoQTUv50LhNx0VrdcK8rcGexcP35FcZDcpgWsAXEyO4xqL5shCY6sFIWB2Q";
 
-const MAX_PROXY_ATTEMPTS = 15;
+const MAX_ATTEMPTS = 12;
 const MAX_STATUS_POLLS = 120;
 const POLL_INTERVAL_MS = 5000;
-const REQUEST_TIMEOUT_MS = 30_000;
+const REQUEST_TIMEOUT_MS = 25_000;
+const PROXY_TIMEOUT_MS = 8_000;
+const MAX_FREE_PROXIES = 8;
+
+const USER_AGENTS = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+];
 
 type ApiJson = Record<string, unknown>;
 
@@ -29,25 +37,34 @@ function pickRandom<T>(arr: readonly T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]!;
 }
 
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j]!, a[i]!];
+  }
+  return a;
+}
+
 function generateFingerprint(): string {
   const hex = "0123456789abcdef";
   let out = "";
-  for (let i = 0; i < 32; i++) {
-    out += hex[Math.floor(Math.random() * 16)];
-  }
+  for (let i = 0; i < 32; i++) out += hex[Math.floor(Math.random() * 16)];
   return out;
 }
 
 function generateFp1(length = 88): string {
   const byteLen = Math.floor((length * 3) / 4);
-  const bytes = crypto.getRandomValues(new Uint8Array(byteLen));
-  return Buffer.from(bytes).toString("base64");
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(byteLen))).toString(
+    "base64"
+  );
 }
 
 function generateXGuide(length = 170): string {
   const byteLen = Math.floor((length * 3) / 4);
-  const bytes = crypto.getRandomValues(new Uint8Array(byteLen));
-  return Buffer.from(bytes).toString("base64");
+  return Buffer.from(crypto.getRandomValues(new Uint8Array(byteLen))).toString(
+    "base64"
+  );
 }
 
 function envProxyList(): string[] {
@@ -57,34 +74,56 @@ function envProxyList(): string[] {
     .filter(Boolean);
 }
 
-let cachedFreeProxies: (string | null)[] | null = null;
+let cachedProxyPool: (string | null)[] | null = null;
 
-async function fetchFreeProxies(): Promise<(string | null)[]> {
-  if (cachedFreeProxies) return cachedFreeProxies;
+/** Prefer direct first, then PROXY_LIST, then a few free proxies. */
+async function getAttemptProxies(): Promise<(string | null)[]> {
+  if (cachedProxyPool) return cachedProxyPool;
 
   const fromEnv = envProxyList();
+  const pool: (string | null)[] = [null]; // always try direct first
+
   if (fromEnv.length) {
-    cachedFreeProxies = fromEnv;
-    return cachedFreeProxies;
+    pool.push(...shuffle(fromEnv));
+  } else {
+    const free = await fetchFreeProxies();
+    pool.push(...shuffle(free).slice(0, MAX_FREE_PROXIES));
   }
 
-  const sources = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=5000&country=all&ssl=all&anonymity=all",
-  ];
+  // de-dupe while keeping order
+  const seen = new Set<string>();
+  const unique: (string | null)[] = [];
+  for (const p of pool) {
+    const key = p ?? "direct";
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(p);
+  }
 
+  cachedProxyPool = unique;
+  console.log(
+    "[faceai] Attempt order:",
+    unique.map((p) => p ?? "direct").join(", ")
+  );
+  return unique;
+}
+
+async function fetchFreeProxies(): Promise<string[]> {
+  const sources = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all",
+  ];
   const proxies: string[] = [];
   for (const url of sources) {
     try {
       const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 10_000);
+      const tid = setTimeout(() => controller.abort(), 8_000);
       const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
       clearTimeout(tid);
       if (!res.ok) continue;
       const text = await res.text();
       for (const line of text.split(/\r?\n/)) {
         const host = line.trim();
-        if (host && host.includes(":")) {
+        if (host && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(host)) {
           proxies.push(`http://${host}`);
         }
       }
@@ -92,14 +131,7 @@ async function fetchFreeProxies(): Promise<(string | null)[]> {
       // ignore
     }
   }
-
-  const unique = [...new Set(proxies)];
-  cachedFreeProxies = unique.length ? unique : [null];
-  console.log(
-    "[faceai] Proxies ready:",
-    unique.length ? `${unique.length} free proxies` : "direct only"
-  );
-  return cachedFreeProxies;
+  return [...new Set(proxies)];
 }
 
 async function fetchViaProxy(
@@ -107,8 +139,9 @@ async function fetchViaProxy(
   init: RequestInit,
   proxyUrl: string | null
 ): Promise<Response> {
+  const timeout = proxyUrl ? PROXY_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
   const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const tid = setTimeout(() => controller.abort(), timeout);
   try {
     if (proxyUrl) {
       const agent = new ProxyAgent(proxyUrl);
@@ -121,6 +154,20 @@ async function fetchViaProxy(
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(tid);
+  }
+}
+
+/** Try proxy, then fall back to direct on network failure. */
+async function fetchResilient(
+  url: string,
+  init: RequestInit,
+  proxyUrl: string | null
+): Promise<Response> {
+  if (!proxyUrl) return fetchViaProxy(url, init, null);
+  try {
+    return await fetchViaProxy(url, init, proxyUrl);
+  } catch {
+    return fetchViaProxy(url, init, null);
   }
 }
 
@@ -137,6 +184,7 @@ type SessionTokens = {
   fingerprint: string;
   fp1: string;
   xGuide: string;
+  userAgent: string;
 };
 
 function guestHeaders(tokens: SessionTokens, withJson = false): Record<string, string> {
@@ -152,13 +200,24 @@ function guestHeaders(tokens: SessionTokens, withJson = false): Record<string, s
     "theme-version": THEME_VERSION,
     "x-code": String(Date.now()),
     "user-language": "undefined",
+    origin: "https://faceai.art",
+    referer: "https://faceai.art/",
+    "User-Agent": tokens.userAgent,
+  };
+}
+
+function newTokens(): SessionTokens {
+  return {
+    fingerprint: generateFingerprint(),
+    fp1: generateFp1(),
+    xGuide: generateXGuide(),
+    userAgent: pickRandom(USER_AGENTS),
   };
 }
 
 async function getQuota(tokens: SessionTokens, proxy: string | null) {
-  const url = `${QUOTA_URL}?_t=${Date.now()}`;
-  const res = await fetchViaProxy(
-    url,
+  const res = await fetchResilient(
+    `${QUOTA_URL}?_t=${Date.now()}`,
     { method: "GET", headers: guestHeaders(tokens), cache: "no-store" },
     proxy
   );
@@ -176,7 +235,7 @@ async function getPresignedUrl(
     ext,
     target: "temp",
   });
-  const res = await fetchViaProxy(
+  const res = await fetchResilient(
     `${PRESIGNED_URL}?${params}`,
     { method: "GET", headers: guestHeaders(tokens), cache: "no-store" },
     proxy
@@ -223,7 +282,7 @@ async function createVideo(
   mode: "t2v" | "i2v",
   sourceImage: string
 ) {
-  const res = await fetchViaProxy(
+  const res = await fetchResilient(
     `${BASE_URL}/create`,
     {
       method: "POST",
@@ -247,7 +306,7 @@ async function checkStatus(
   tokens: SessionTokens,
   proxy: string | null
 ) {
-  const res = await fetchViaProxy(
+  const res = await fetchResilient(
     `${BASE_URL}/status`,
     {
       method: "POST",
@@ -311,8 +370,7 @@ async function uploadSourceImage(
   }
 
   try {
-    const path = new URL(fileUrl).pathname;
-    return path;
+    return new URL(fileUrl).pathname;
   } catch {
     return fileUrl.startsWith("/") ? fileUrl : `/${fileUrl}`;
   }
@@ -326,9 +384,14 @@ async function pollUntilReady(
 ): Promise<string> {
   for (let poll = 1; poll <= MAX_STATUS_POLLS; poll++) {
     try {
+      // Prefer same session path; resilient fetch falls back to direct if proxy dies
       const statusResp = await checkStatus(taskId, tokens, proxy);
       if (getCode(statusResp) !== 100000) {
-        console.log(logPrefix, `Status ${poll} unexpected:`, JSON.stringify(statusResp).slice(0, 200));
+        console.log(
+          logPrefix,
+          `Status ${poll} unexpected:`,
+          JSON.stringify(statusResp).slice(0, 200)
+        );
         await sleep(POLL_INTERVAL_MS);
         continue;
       }
@@ -365,7 +428,7 @@ export type GenerateOptions = {
   logPrefix?: string;
 };
 
-/** FaceAI text-to-video / image-to-video with fingerprint + proxy rotation. */
+/** FaceAI text-to-video / image-to-video — direct first, then proxies. */
 export async function runFullVideoGeneration(
   promptOrOptions: string | GenerateOptions,
   aspectRatioArg = "16:9",
@@ -386,20 +449,18 @@ export async function runFullVideoGeneration(
   const logPrefix = options.logPrefix ?? "[faceai]";
   const image = options.image ?? null;
 
-  const proxies = await fetchFreeProxies();
+  const proxies = await getAttemptProxies();
   let lastError = "All attempts failed";
+  let hitIpLimit = false;
 
-  for (let attempt = 1; attempt <= MAX_PROXY_ATTEMPTS; attempt++) {
-    const tokens: SessionTokens = {
-      fingerprint: generateFingerprint(),
-      fp1: generateFp1(),
-      xGuide: generateXGuide(),
-    };
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const tokens = newTokens();
     const proxy = proxies[(attempt - 1) % proxies.length] ?? null;
     console.log(
       logPrefix,
-      `Attempt ${attempt}/${MAX_PROXY_ATTEMPTS}`,
-      proxy ?? "direct"
+      `Attempt ${attempt}/${MAX_ATTEMPTS}`,
+      proxy ?? "direct",
+      tokens.fingerprint.slice(0, 8) + "…"
     );
 
     try {
@@ -410,10 +471,9 @@ export async function runFullVideoGeneration(
           features && typeof features === "object"
             ? (features.ai_video_generator as ApiJson | undefined)
             : undefined;
-        const remaining = videoFeature?.remaining_count ?? "N/A";
-        console.log(logPrefix, "Quota remaining:", remaining);
+        console.log(logPrefix, "Quota remaining:", videoFeature?.remaining_count ?? "N/A");
       } catch (e) {
-        console.warn(logPrefix, "Quota check failed:", e);
+        console.warn(logPrefix, "Quota check skipped:", e);
       }
 
       let mode: "t2v" | "i2v" = "t2v";
@@ -441,8 +501,12 @@ export async function runFullVideoGeneration(
 
       const code = getCode(createResp);
       if (code === 638) {
+        hitIpLimit = true;
         lastError = "Anonymous IP limit (638)";
-        console.warn(logPrefix, lastError, "— next proxy…");
+        console.warn(logPrefix, lastError, "— rotating…");
+        // Invalidate proxy cache so next call can refresh free list
+        if (attempt === proxies.length) cachedProxyPool = null;
+        await sleep(400 + Math.floor(Math.random() * 600));
         continue;
       }
       if (code !== 100000) {
@@ -466,9 +530,9 @@ export async function runFullVideoGeneration(
     }
   }
 
-  if (lastError.includes("638") || /limit|quota|rate/i.test(lastError)) {
+  if (hitIpLimit || lastError.includes("638") || /limit|quota|rate/i.test(lastError)) {
     throw new RateLimitError(
-      "FaceAI rate/IP limit hit. Set PROXY_LIST in .env.local or try again later."
+      "FaceAI IP/rate limit after retries. Add working proxies via PROXY_LIST in Vercel env, then redeploy."
     );
   }
   throw new Error(lastError);
