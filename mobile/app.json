@@ -1,0 +1,73 @@
+{
+  "expo": {
+    "name": "Unlimited Video Gen Free",
+    "slug": "unlimited-video-generation-free",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "unlimitedvideogen",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.unlimitedvideogen.free",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "This app needs camera access so you can create image-to-video and capture media inside Unlimited Video Generation Free Forever.",
+        "NSMicrophoneUsageDescription": "This app needs microphone access for video creation features that include audio.",
+        "NSPhotoLibraryUsageDescription": "This app needs photo library access so you can upload images to generate AI videos.",
+        "NSPhotoLibraryAddUsageDescription": "This app may save generated videos to your photo library."
+      },
+      "privacyManifests": {
+        "NSPrivacyAccessedAPITypes": [
+          {
+            "NSPrivacyAccessedAPIType": "NSPrivacyAccessedAPICategoryUserDefaults",
+            "NSPrivacyAccessedAPITypeReasons": [
+              "CA92.1"
+            ]
+          }
+        ]
+      }
+    },
+    "android": {
+      "package": "com.unlimitedvideogen.free",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#000000",
+        "foregroundImage": "./assets/adaptive-icon.png"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.INTERNET"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#000000",
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "12eb33d3-54a7-4e07-9f79-3e8caf76e6a4"
+      },
+      "webAppUrl": "https://video-generator-two-pied.vercel.app/"
+    },
+    "owner": "gabrielsalem"
+  }
+}
