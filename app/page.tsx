@@ -2,8 +2,6 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import {
-  Menu,
-  RotateCw,
   Play,
   ImagePlus,
   Loader2,
@@ -11,6 +9,7 @@ import {
   X,
   AlertCircle,
   ChevronDown,
+  RotateCw,
 } from "lucide-react";
 
 type Status = "idle" | "generating" | "completed" | "failed";
@@ -26,7 +25,6 @@ interface VideoResult {
 const ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"];
 
 export default function Page() {
-  const [activeTab, setActiveTab] = useState<"ask" | "imagine">("imagine");
   const [mode, setMode] = useState<Mode>("text");
   const [prompt, setPrompt] = useState("");
   const [aspectRatio, setAspectRatio] = useState("16:9");
@@ -158,46 +156,18 @@ export default function Page() {
 
   return (
     <div className="min-h-screen bg-background text-foreground flex flex-col">
-      {/* Header */}
+      {/* Header — only functional controls (no dead menu / Ask tab) */}
       <header className="flex items-center justify-between px-4 pt-3 pb-2">
-        <button
-          aria-label="Menu"
-          className="grid h-9 w-9 place-items-center rounded-full text-foreground hover:bg-surface-2 transition-colors"
-        >
-          <Menu className="h-5 w-5" strokeWidth={1.75} />
-        </button>
+        <div className="h-9 w-9" aria-hidden="true" />
 
-        <div className="flex items-center gap-7">
-          <button
-            onClick={() => setActiveTab("ask")}
-            className={`relative pb-1.5 text-[17px] font-semibold tracking-tight transition-colors ${
-              activeTab === "ask" ? "text-foreground" : "text-muted-foreground"
-            }`}
-          >
-            Ask
-            <span
-              className={`absolute -bottom-0.5 left-1/2 -translate-x-1/2 h-[3px] rounded-full bg-foreground transition-all duration-300 ${
-                activeTab === "ask" ? "w-6 opacity-100" : "w-0 opacity-0"
-              }`}
-            />
-          </button>
-          <button
-            onClick={() => setActiveTab("imagine")}
-            className={`relative pb-1.5 text-[17px] font-semibold tracking-tight transition-colors ${
-              activeTab === "imagine" ? "text-foreground" : "text-muted-foreground"
-            }`}
-          >
-            Imagine
-            <span
-              className={`absolute -bottom-0.5 left-1/2 -translate-x-1/2 h-[3px] rounded-full bg-foreground transition-all duration-300 ${
-                activeTab === "imagine" ? "w-6 opacity-100" : "w-0 opacity-0"
-              }`}
-            />
-          </button>
+        <div className="relative pb-1.5 text-[17px] font-semibold tracking-tight text-foreground">
+          Imagine
+          <span className="absolute -bottom-0.5 left-1/2 -translate-x-1/2 h-[3px] w-6 rounded-full bg-foreground" />
         </div>
 
         <button
-          aria-label="Refresh"
+          type="button"
+          aria-label="Clear and start over"
           onClick={handleReset}
           className="grid h-9 w-9 place-items-center rounded-full text-foreground hover:bg-surface-2 transition-colors"
         >
