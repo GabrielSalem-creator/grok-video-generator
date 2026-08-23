@@ -115,21 +115,127 @@ async function uploadBase64Image(
   return typeof url === "string" && url ? url : null;
 }
 
+export type VideoModelInputs = {
+  aspect_ratio?: string[];
+  duration_options?: number[];
+  quality_options?: string[];
+};
+
+export type VideoModel = {
+  id?: number;
+  modelType?: string;
+  title: string;
+  workflow_name: string;
+  icon?: string;
+  subtitle?: string;
+  inputs?: VideoModelInputs;
+  estimated_duration_seconds?: number;
+};
+
+export type ModelsCatalog = {
+  textToVideo: VideoModel[];
+  imageToVideo: VideoModel[];
+};
+
+let modelsCache: { t: number; v: ModelsCatalog } | null = null;
+
+export async function fetchModelsCatalog(): Promise<ModelsCatalog> {
+  if (modelsCache && Date.now() - modelsCache.t < 10 * 60_000) {
+    return modelsCache.v;
+  }
+
+  const res = await upstreamCall("GET", "/V3/aiServices/models");
+  if (!res.ok) {
+    throw new Error(
+      typeof res.data.error === "string"
+        ? res.data.error
+        : `Failed to load models (${res.status})`
+    );
+  }
+
+  const catalog: ModelsCatalog = {
+    textToVideo: Array.isArray(res.data.textToVideo)
+      ? (res.data.textToVideo as VideoModel[])
+      : [],
+    imageToVideo: Array.isArray(res.data.imageToVideo)
+      ? (res.data.imageToVideo as VideoModel[])
+      : [],
+  };
+  modelsCache = { t: Date.now(), v: catalog };
+  return catalog;
+}
+
+function resolveModelOptions(
+  modelName: string | undefined,
+  mode: "t2v" | "i2v",
+  catalog: ModelsCatalog | null
+): { model: string; aspectRatios: string[]; durations: number[]; qualities: string[] } {
+  const list =
+    mode === "t2v"
+      ? catalog?.textToVideo ?? []
+      : catalog?.imageToVideo ?? [];
+  const fallback =
+    mode === "t2v" ? DEFAULT_TEXT_MODEL : DEFAULT_IMAGE_MODEL;
+  const found =
+    list.find((m) => m.workflow_name === modelName) ??
+    list.find((m) => m.workflow_name === fallback) ??
+    list[0];
+
+  const aspectRatios =
+    found?.inputs?.aspect_ratio?.filter(Boolean) ?? ["16:9", "9:16", "1:1"];
+  const durations =
+    found?.inputs?.duration_options?.filter((n) => typeof n === "number") ?? [
+      5, 10,
+    ];
+  const qualities =
+    found?.inputs?.quality_options?.filter(Boolean) ?? ["720p"];
+
+  return {
+    model: found?.workflow_name ?? modelName ?? fallback,
+    aspectRatios,
+    durations,
+    qualities,
+  };
+}
+
 async function submitGeneration(
   deviceId: string,
   mode: "t2v" | "i2v",
   prompt: string,
-  aspectRatio: string,
+  options: {
+    model?: string;
+    aspectRatio?: string;
+    duration?: number;
+    quality?: string;
+  },
   imageInput?: string
 ): Promise<{ taskId: string } | { error: string }> {
+  let catalog: ModelsCatalog | null = null;
+  try {
+    catalog = await fetchModelsCatalog();
+  } catch {
+    // use defaults if catalog unavailable
+  }
+
+  const resolved = resolveModelOptions(options.model, mode, catalog);
+  const aspectRatio = resolved.aspectRatios.includes(options.aspectRatio ?? "")
+    ? (options.aspectRatio as string)
+    : resolved.aspectRatios[0] ?? "16:9";
+  const duration = resolved.durations.includes(options.duration ?? -1)
+    ? (options.duration as number)
+    : resolved.durations[0] ?? 5;
+  const quality = resolved.qualities.includes(options.quality ?? "")
+    ? (options.quality as string)
+    : resolved.qualities[0] ?? "720p";
+
   const payload: ApiJson = {
     deviceId,
     creditCost: MIN_CREDIT_COST,
-    model: mode === "t2v" ? DEFAULT_TEXT_MODEL : DEFAULT_IMAGE_MODEL,
+    model: resolved.model,
     prompt: prompt.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 1000),
     aspect_ratio: aspectRatio,
-    duration: 5,
-    quality: "720p",
+    duration,
+    quality,
   };
 
   if (mode === "i2v") {
@@ -209,6 +315,9 @@ export type ImageUploadInput = {
 export type GenerateOptions = {
   prompt: string;
   aspectRatio?: string;
+  model?: string;
+  duration?: number;
+  quality?: string;
   image?: ImageUploadInput | null;
   logPrefix?: string;
 };
@@ -230,9 +339,12 @@ export async function runFullVideoGeneration(
       : promptOrOptions;
 
   const prompt = options.prompt.trim();
-  const aspectRatio = normalizeAspectRatio(options.aspectRatio ?? "16:9");
+  const aspectRatio = options.aspectRatio ?? "16:9";
   const logPrefix = options.logPrefix ?? "[neon]";
   const image = options.image ?? null;
+  const model = options.model;
+  const duration = options.duration;
+  const quality = options.quality;
 
   if (!prompt) throw new Error("Prompt is required");
 
@@ -240,7 +352,15 @@ export async function runFullVideoGeneration(
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const deviceId = generateDeviceId();
-    console.log(logPrefix, `Attempt ${attempt}/${MAX_ATTEMPTS}`, deviceId);
+    console.log(
+      logPrefix,
+      `Attempt ${attempt}/${MAX_ATTEMPTS}`,
+      deviceId,
+      model ?? "default",
+      `${duration ?? "?"}s`,
+      quality ?? "?",
+      aspectRatio
+    );
 
     try {
       await ensureDevice(deviceId);
@@ -261,7 +381,7 @@ export async function runFullVideoGeneration(
         deviceId,
         mode,
         prompt,
-        aspectRatio,
+        { model, aspectRatio, duration, quality },
         imageInput
       );
 

@@ -9,6 +9,15 @@ export async function POST(request: Request) {
     const body = await request.json();
     const prompt = body?.prompt as string | undefined;
     const aspectRatio = (body?.aspectRatio as string) || "16:9";
+    const model = typeof body?.model === "string" ? body.model : undefined;
+    const duration =
+      typeof body?.duration === "number"
+        ? body.duration
+        : body?.duration != null
+          ? Number(body.duration)
+          : undefined;
+    const quality =
+      typeof body?.quality === "string" ? body.quality : undefined;
 
     if (!prompt || typeof prompt !== "string" || prompt.trim().length === 0) {
       return NextResponse.json(
@@ -20,6 +29,9 @@ export async function POST(request: Request) {
     const { id, videoUrl } = await runFullVideoGeneration({
       prompt: prompt.trim(),
       aspectRatio,
+      model,
+      duration: Number.isFinite(duration) ? duration : undefined,
+      quality,
       logPrefix: "[neon]",
     });
 

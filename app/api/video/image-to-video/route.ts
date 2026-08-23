@@ -13,8 +13,17 @@ export async function POST(request: Request) {
     const formData = await request.formData();
     const promptRaw = formData.get("prompt") as string | null;
     const aspectRatio = (formData.get("aspectRatio") as string) || "16:9";
+    const model = (formData.get("model") as string | null)?.trim() || undefined;
+    const durationRaw = formData.get("duration");
+    const quality =
+      (formData.get("quality") as string | null)?.trim() || undefined;
     const imageUrl = (formData.get("imageUrl") as string | null)?.trim() || "";
     const imageFile = formData.get("image");
+
+    const duration =
+      durationRaw != null && String(durationRaw).trim() !== ""
+        ? Number(durationRaw)
+        : undefined;
 
     const prompt =
       promptRaw?.trim() ||
@@ -46,6 +55,9 @@ export async function POST(request: Request) {
     const { id, videoUrl } = await runFullVideoGeneration({
       prompt,
       aspectRatio,
+      model,
+      duration: Number.isFinite(duration) ? duration : undefined,
+      quality,
       image,
       logPrefix: "[neon-i2v]",
     });
