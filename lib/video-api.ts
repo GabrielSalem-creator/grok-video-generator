@@ -1,25 +1,25 @@
-import { ProxyAgent, fetch as undiciFetch } from "undici";
+import crypto from "node:crypto";
 
-const BASE_URL = "https://faceai.art/api/faceai/ai_video_generator";
-const QUOTA_URL = "https://faceai.art/api/users/faceai-quota";
-const PRESIGNED_URL = "https://faceai.art/api/r2_presigned_url";
-const THEME_VERSION =
-  "83EmcUoQTUv50LhNx0VrdcK8rcGexcP35FcZDcpgWsAXEyO4xqL5shCY6sFIWB2Q";
+const BACKEND = "https://shark-app-qm22v.ondigitalocean.app";
+const TIMEOUT_MS = 30_000;
+const MAX_ATTEMPTS = 4;
+const MAX_STATUS_POLLS = 90;
+const POLL_INTERVAL_MS = 8_000;
 
-const MAX_ATTEMPTS = 12;
-const MAX_STATUS_POLLS = 120;
-const POLL_INTERVAL_MS = 5000;
-const REQUEST_TIMEOUT_MS = 25_000;
-const PROXY_TIMEOUT_MS = 8_000;
-const MAX_FREE_PROXIES = 8;
-
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-];
+const DEFAULT_TEXT_MODEL = "kling-v3-standard";
+const DEFAULT_IMAGE_MODEL = "kling-v3-standard";
+const MIN_CREDIT_COST = 0.0000000000001;
 
 type ApiJson = Record<string, unknown>;
+
+type WorkItem = {
+  id?: string;
+  status?: string;
+  link?: string;
+  error?: string | null;
+};
+
+const registeredDevices = new Set<string>();
 
 export class RateLimitError extends Error {
   readonly status = 429;
@@ -33,290 +33,166 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function pickRandom<T>(arr: readonly T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)]!;
+function generateDeviceId(): string {
+  return "d_" + crypto.randomBytes(11).toString("hex");
 }
 
-function shuffle<T>(arr: T[]): T[] {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j]!, a[i]!];
-  }
-  return a;
-}
-
-function generateFingerprint(): string {
-  const hex = "0123456789abcdef";
-  let out = "";
-  for (let i = 0; i < 32; i++) out += hex[Math.floor(Math.random() * 16)];
-  return out;
-}
-
-function generateFp1(length = 88): string {
-  const byteLen = Math.floor((length * 3) / 4);
-  return Buffer.from(crypto.getRandomValues(new Uint8Array(byteLen))).toString(
-    "base64"
-  );
-}
-
-function generateXGuide(length = 170): string {
-  const byteLen = Math.floor((length * 3) / 4);
-  return Buffer.from(crypto.getRandomValues(new Uint8Array(byteLen))).toString(
-    "base64"
-  );
-}
-
-function envProxyList(): string[] {
-  return (process.env.PROXY_LIST ?? "")
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean);
-}
-
-let cachedProxyPool: (string | null)[] | null = null;
-
-/** Prefer direct first, then PROXY_LIST, then a few free proxies. */
-async function getAttemptProxies(): Promise<(string | null)[]> {
-  if (cachedProxyPool) return cachedProxyPool;
-
-  const fromEnv = envProxyList();
-  const pool: (string | null)[] = [null]; // always try direct first
-
-  if (fromEnv.length) {
-    pool.push(...shuffle(fromEnv));
-  } else {
-    const free = await fetchFreeProxies();
-    pool.push(...shuffle(free).slice(0, MAX_FREE_PROXIES));
-  }
-
-  // de-dupe while keeping order
-  const seen = new Set<string>();
-  const unique: (string | null)[] = [];
-  for (const p of pool) {
-    const key = p ?? "direct";
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(p);
-  }
-
-  cachedProxyPool = unique;
-  console.log(
-    "[faceai] Attempt order:",
-    unique.map((p) => p ?? "direct").join(", ")
-  );
-  return unique;
-}
-
-async function fetchFreeProxies(): Promise<string[]> {
-  const sources = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all",
-  ];
-  const proxies: string[] = [];
-  for (const url of sources) {
-    try {
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 8_000);
-      const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
-      clearTimeout(tid);
-      if (!res.ok) continue;
-      const text = await res.text();
-      for (const line of text.split(/\r?\n/)) {
-        const host = line.trim();
-        if (host && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(host)) {
-          proxies.push(`http://${host}`);
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return [...new Set(proxies)];
-}
-
-async function fetchViaProxy(
-  url: string,
-  init: RequestInit,
-  proxyUrl: string | null
-): Promise<Response> {
-  const timeout = proxyUrl ? PROXY_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+async function upstreamCall(
+  method: string,
+  path: string,
+  body?: unknown
+): Promise<{ ok: boolean; status: number; data: ApiJson }> {
   const controller = new AbortController();
-  const tid = setTimeout(() => controller.abort(), timeout);
+  const tid = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
-    if (proxyUrl) {
-      const agent = new ProxyAgent(proxyUrl);
-      return (await undiciFetch(url, {
-        ...init,
-        dispatcher: agent,
-        signal: controller.signal,
-      })) as unknown as Response;
-    }
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(tid);
-  }
-}
-
-/** Try proxy, then fall back to direct on network failure. */
-async function fetchResilient(
-  url: string,
-  init: RequestInit,
-  proxyUrl: string | null
-): Promise<Response> {
-  if (!proxyUrl) return fetchViaProxy(url, init, null);
-  try {
-    return await fetchViaProxy(url, init, proxyUrl);
-  } catch {
-    return fetchViaProxy(url, init, null);
-  }
-}
-
-async function parseJson(res: Response): Promise<ApiJson> {
-  const text = await res.text();
-  try {
-    return JSON.parse(text) as ApiJson;
-  } catch {
-    return { raw: text, httpStatus: res.status };
-  }
-}
-
-type SessionTokens = {
-  fingerprint: string;
-  fp1: string;
-  xGuide: string;
-  userAgent: string;
-};
-
-function guestHeaders(tokens: SessionTokens, withJson = false): Record<string, string> {
-  return {
-    accept: withJson ? "application/json, text/plain, */*" : "*/*",
-    "accept-language": "en-GB,en-US;q=0.9,en;q=0.8,fr;q=0.7",
-    ...(withJson ? { "content-type": "application/json" } : {}),
-    fp: tokens.fingerprint,
-    fp1: tokens.fp1,
-    "x-fingerprint": tokens.fingerprint,
-    "x-guest-id": tokens.fingerprint,
-    "x-guide": tokens.xGuide,
-    "theme-version": THEME_VERSION,
-    "x-code": String(Date.now()),
-    "user-language": "undefined",
-    origin: "https://faceai.art",
-    referer: "https://faceai.art/",
-    "User-Agent": tokens.userAgent,
-  };
-}
-
-function newTokens(): SessionTokens {
-  return {
-    fingerprint: generateFingerprint(),
-    fp1: generateFp1(),
-    xGuide: generateXGuide(),
-    userAgent: pickRandom(USER_AGENTS),
-  };
-}
-
-async function getQuota(tokens: SessionTokens, proxy: string | null) {
-  const res = await fetchResilient(
-    `${QUOTA_URL}?_t=${Date.now()}`,
-    { method: "GET", headers: guestHeaders(tokens), cache: "no-store" },
-    proxy
-  );
-  return parseJson(res);
-}
-
-async function getPresignedUrl(
-  contentType: string,
-  ext: string,
-  tokens: SessionTokens,
-  proxy: string | null
-) {
-  const params = new URLSearchParams({
-    content_type: contentType,
-    ext,
-    target: "temp",
-  });
-  const res = await fetchResilient(
-    `${PRESIGNED_URL}?${params}`,
-    { method: "GET", headers: guestHeaders(tokens), cache: "no-store" },
-    proxy
-  );
-  return parseJson(res);
-}
-
-async function uploadImage(
-  presignedUrl: string,
-  imageBytes: Uint8Array,
-  contentType: string,
-  proxy: string | null
-): Promise<boolean> {
-  const tryPut = async (useProxy: string | null) => {
-    const res = await fetchViaProxy(
-      presignedUrl,
-      {
-        method: "PUT",
-        headers: { "Content-Type": contentType },
-        body: Buffer.from(imageBytes),
+    const res = await fetch(BACKEND + path, {
+      method,
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
       },
-      useProxy
-    );
-    return res.status === 200 || res.status === 204;
-  };
-
-  try {
-    if (await tryPut(proxy)) return true;
-  } catch {
-    // fall through
-  }
-  try {
-    return await tryPut(null);
-  } catch {
-    return false;
+      body: body != null ? JSON.stringify(body) : undefined,
+      cache: "no-store",
+    });
+    clearTimeout(tid);
+    const text = await res.text();
+    let data: ApiJson;
+    try {
+      data = JSON.parse(text) as ApiJson;
+    } catch {
+      data = { error: "non-JSON upstream", raw: text.slice(0, 200) };
+    }
+    return { ok: res.ok, status: res.status, data };
+  } catch (e) {
+    clearTimeout(tid);
+    const isTimeout =
+      e instanceof Error && e.name === "AbortError";
+    return {
+      ok: false,
+      status: isTimeout ? 504 : 502,
+      data: {
+        error: isTimeout ? "Upstream timeout" : "Upstream unreachable",
+      },
+    };
   }
 }
 
-async function createVideo(
+async function ensureDevice(deviceId: string) {
+  if (registeredDevices.has(deviceId)) return;
+  await upstreamCall("POST", "/V3/user/deviceId", {
+    deviceId,
+    platformName: "android",
+  });
+  await upstreamCall("POST", `/V3/user/${deviceId}/dailyCheckin/claim`, {});
+  registeredDevices.add(deviceId);
+}
+
+function getUserWorks(data: ApiJson): WorkItem[] {
+  const user = data.user as ApiJson | undefined;
+  if (!user) return [];
+  const recent = user.recentWorks;
+  if (Array.isArray(recent)) return recent as WorkItem[];
+  const history = user.history;
+  if (Array.isArray(history)) return history as WorkItem[];
+  return [];
+}
+
+async function uploadBase64Image(
+  deviceId: string,
+  bytes: Uint8Array
+): Promise<string | null> {
+  const base64Image = Buffer.from(bytes).toString("base64");
+  if (base64Image.length > 10_000_000) return null;
+
+  const res = await upstreamCall("POST", "/aiServices/upload-url", {
+    deviceId,
+    base64Image,
+  });
+  if (!res.ok) return null;
+
+  const url = res.data.imageUrl ?? res.data.url;
+  return typeof url === "string" && url ? url : null;
+}
+
+async function submitGeneration(
+  deviceId: string,
+  mode: "t2v" | "i2v",
   prompt: string,
   aspectRatio: string,
-  tokens: SessionTokens,
-  proxy: string | null,
-  mode: "t2v" | "i2v",
-  sourceImage: string
-) {
-  const res = await fetchResilient(
-    `${BASE_URL}/create`,
-    {
-      method: "POST",
-      headers: guestHeaders(tokens, true),
-      body: JSON.stringify({
-        generation_mode: mode,
-        prompt,
-        source_image: sourceImage,
-        aspect_ratio: aspectRatio,
-        task_type: "ai_video_generator",
-      }),
-      cache: "no-store",
-    },
-    proxy
-  );
-  return parseJson(res);
+  imageInput?: string
+): Promise<{ taskId: string } | { error: string }> {
+  const payload: ApiJson = {
+    deviceId,
+    creditCost: MIN_CREDIT_COST,
+    model: mode === "t2v" ? DEFAULT_TEXT_MODEL : DEFAULT_IMAGE_MODEL,
+    prompt: prompt.replace(/[\x00-\x1F\x7F]/g, "").slice(0, 1000),
+    aspect_ratio: aspectRatio,
+    duration: 5,
+    quality: "720p",
+  };
+
+  if (mode === "i2v") {
+    if (!imageInput) return { error: "Image upload failed" };
+    payload.image_input = imageInput;
+  }
+
+  const path =
+    mode === "t2v"
+      ? "/V3/aiServices/textToVideo"
+      : "/V3/aiServices/imageToVideo";
+
+  const res = await upstreamCall("POST", path, payload);
+  if (!res.ok) {
+    const err =
+      typeof res.data.error === "string"
+        ? res.data.error
+        : `Generation failed (${res.status})`;
+    return { error: err };
+  }
+
+  const taskId = res.data.videoQueryID;
+  if (typeof taskId !== "string" || !taskId) {
+    return { error: "No videoQueryID in upstream response" };
+  }
+  return { taskId };
 }
 
-async function checkStatus(
+async function pollUntilReady(
+  deviceId: string,
   taskId: string,
-  tokens: SessionTokens,
-  proxy: string | null
-) {
-  const res = await fetchResilient(
-    `${BASE_URL}/status`,
-    {
-      method: "POST",
-      headers: guestHeaders(tokens, true),
-      body: JSON.stringify({ task_id: taskId }),
-      cache: "no-store",
-    },
-    proxy
-  );
-  return parseJson(res);
+  logPrefix: string
+): Promise<string> {
+  for (let poll = 1; poll <= MAX_STATUS_POLLS; poll++) {
+    const res = await upstreamCall("GET", `/V3/user/${deviceId}`);
+    if (!res.ok) {
+      console.warn(logPrefix, `Poll ${poll}: user fetch failed`, res.status);
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
+    const works = getUserWorks(res.data);
+    const work =
+      works.find((w) => w.id === taskId) ??
+      works.find((w) => w.status === "processing") ??
+      works[0];
+
+    if (work) {
+      console.log(
+        logPrefix,
+        `Poll ${poll}: status=${work.status ?? "unknown"} id=${work.id ?? "n/a"}`
+      );
+      if (work.status === "ready" && work.link) return work.link;
+      if (work.status === "error") {
+        throw new Error(work.error || "Generation failed upstream");
+      }
+    } else {
+      console.log(logPrefix, `Poll ${poll}: no works yet`);
+    }
+
+    await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error("Status polling timed out");
 }
 
 export function normalizeAspectRatio(aspectRatio: string): string {
@@ -330,97 +206,6 @@ export type ImageUploadInput = {
   ext: string;
 };
 
-function getCode(data: ApiJson): number | null {
-  return typeof data.code === "number" ? data.code : null;
-}
-
-function getData(data: ApiJson): ApiJson {
-  const d = data.data;
-  return d && typeof d === "object" && d !== null ? (d as ApiJson) : {};
-}
-
-async function uploadSourceImage(
-  image: ImageUploadInput,
-  tokens: SessionTokens,
-  proxy: string | null,
-  logPrefix: string
-): Promise<string | null> {
-  const presign = await getPresignedUrl(
-    image.contentType,
-    image.ext,
-    tokens,
-    proxy
-  );
-  if (getCode(presign) !== 100000) {
-    console.warn(logPrefix, "Presign failed:", JSON.stringify(presign).slice(0, 300));
-    return null;
-  }
-  const data = getData(presign);
-  const presignedUrl = data.presigned_url;
-  const fileUrl = data.file_url;
-  if (typeof presignedUrl !== "string" || typeof fileUrl !== "string") {
-    return null;
-  }
-
-  console.log(logPrefix, "Uploading image…");
-  const ok = await uploadImage(presignedUrl, image.bytes, image.contentType, proxy);
-  if (!ok) {
-    console.warn(logPrefix, "Upload failed");
-    return null;
-  }
-
-  try {
-    return new URL(fileUrl).pathname;
-  } catch {
-    return fileUrl.startsWith("/") ? fileUrl : `/${fileUrl}`;
-  }
-}
-
-async function pollUntilReady(
-  taskId: string,
-  tokens: SessionTokens,
-  proxy: string | null,
-  logPrefix: string
-): Promise<string> {
-  for (let poll = 1; poll <= MAX_STATUS_POLLS; poll++) {
-    try {
-      // Prefer same session path; resilient fetch falls back to direct if proxy dies
-      const statusResp = await checkStatus(taskId, tokens, proxy);
-      if (getCode(statusResp) !== 100000) {
-        console.log(
-          logPrefix,
-          `Status ${poll} unexpected:`,
-          JSON.stringify(statusResp).slice(0, 200)
-        );
-        await sleep(POLL_INTERVAL_MS);
-        continue;
-      }
-
-      const data = getData(statusResp);
-      const status = data.status;
-      const progress = data.progress ?? 0;
-      console.log(logPrefix, `Status ${poll}: status=${status} progress=${progress}%`);
-
-      if (status === 3) {
-        const videoUrl = data.result_video;
-        if (typeof videoUrl === "string" && videoUrl) return videoUrl;
-        throw new Error("Completed but no result_video");
-      }
-      if (status === 4) {
-        throw new Error(`Generation failed: ${JSON.stringify(data).slice(0, 300)}`);
-      }
-
-      await sleep(POLL_INTERVAL_MS);
-    } catch (e) {
-      if (e instanceof Error && e.message.startsWith("Generation failed")) throw e;
-      if (e instanceof Error && e.message.includes("result_video")) throw e;
-      console.warn(logPrefix, "Poll error:", e);
-      await sleep(POLL_INTERVAL_MS);
-    }
-  }
-  throw new Error("Status polling timed out");
-}
-
 export type GenerateOptions = {
   prompt: string;
   aspectRatio?: string;
@@ -428,12 +213,12 @@ export type GenerateOptions = {
   logPrefix?: string;
 };
 
-/** FaceAI text-to-video / image-to-video — direct first, then proxies. */
+/** Neon Studio backend — text-to-video / image-to-video via DigitalOcean API. */
 export async function runFullVideoGeneration(
   promptOrOptions: string | GenerateOptions,
   aspectRatioArg = "16:9",
   _withAudio = false,
-  logPrefixArg = "[faceai]"
+  logPrefixArg = "[neon]"
 ): Promise<{ id: string; videoUrl: string }> {
   const options: GenerateOptions =
     typeof promptOrOptions === "string"
@@ -446,83 +231,55 @@ export async function runFullVideoGeneration(
 
   const prompt = options.prompt.trim();
   const aspectRatio = normalizeAspectRatio(options.aspectRatio ?? "16:9");
-  const logPrefix = options.logPrefix ?? "[faceai]";
+  const logPrefix = options.logPrefix ?? "[neon]";
   const image = options.image ?? null;
 
-  const proxies = await getAttemptProxies();
+  if (!prompt) throw new Error("Prompt is required");
+
   let lastError = "All attempts failed";
-  let hitIpLimit = false;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const tokens = newTokens();
-    const proxy = proxies[(attempt - 1) % proxies.length] ?? null;
-    console.log(
-      logPrefix,
-      `Attempt ${attempt}/${MAX_ATTEMPTS}`,
-      proxy ?? "direct",
-      tokens.fingerprint.slice(0, 8) + "…"
-    );
+    const deviceId = generateDeviceId();
+    console.log(logPrefix, `Attempt ${attempt}/${MAX_ATTEMPTS}`, deviceId);
 
     try {
-      try {
-        const quota = await getQuota(tokens, proxy);
-        const features = getData(quota).features as ApiJson | undefined;
-        const videoFeature =
-          features && typeof features === "object"
-            ? (features.ai_video_generator as ApiJson | undefined)
-            : undefined;
-        console.log(logPrefix, "Quota remaining:", videoFeature?.remaining_count ?? "N/A");
-      } catch (e) {
-        console.warn(logPrefix, "Quota check skipped:", e);
-      }
+      await ensureDevice(deviceId);
 
-      let mode: "t2v" | "i2v" = "t2v";
-      let sourceImage = "";
-
+      let imageInput: string | undefined;
       if (image) {
-        const path = await uploadSourceImage(image, tokens, proxy, logPrefix);
-        if (!path) {
+        console.log(logPrefix, "Uploading image…");
+        const url = await uploadBase64Image(deviceId, image.bytes);
+        if (!url) {
           lastError = "Image upload failed";
           continue;
         }
-        sourceImage = path;
-        mode = "i2v";
+        imageInput = url;
       }
 
-      const createResp = await createVideo(
+      const mode = imageInput ? "i2v" : "t2v";
+      const submitted = await submitGeneration(
+        deviceId,
+        mode,
         prompt,
         aspectRatio,
-        tokens,
-        proxy,
-        mode,
-        sourceImage
+        imageInput
       );
-      console.log(logPrefix, "Create:", JSON.stringify(createResp).slice(0, 400));
 
-      const code = getCode(createResp);
-      if (code === 638) {
-        hitIpLimit = true;
-        lastError = "Anonymous IP limit (638)";
-        console.warn(logPrefix, lastError, "— rotating…");
-        // Invalidate proxy cache so next call can refresh free list
-        if (attempt === proxies.length) cachedProxyPool = null;
-        await sleep(400 + Math.floor(Math.random() * 600));
-        continue;
-      }
-      if (code !== 100000) {
-        lastError = `Create failed code ${code}: ${JSON.stringify(createResp).slice(0, 200)}`;
+      if ("error" in submitted) {
+        lastError = submitted.error;
+        if (/rate|limit|quota|credit/i.test(lastError)) {
+          await sleep(500 + Math.floor(Math.random() * 500));
+        }
         continue;
       }
 
-      const taskId = getData(createResp).task_id;
-      if (typeof taskId !== "string" || !taskId) {
-        lastError = "No task_id in create response";
-        continue;
-      }
-
-      console.log(logPrefix, "Task ID:", taskId);
-      const videoUrl = await pollUntilReady(taskId, tokens, proxy, logPrefix);
-      return { id: taskId, videoUrl };
+      console.log(logPrefix, "Task ID:", submitted.taskId);
+      const videoUrl = await pollUntilReady(
+        deviceId,
+        submitted.taskId,
+        logPrefix
+      );
+      return { id: submitted.taskId, videoUrl };
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
       console.warn(logPrefix, "Attempt error:", lastError);
@@ -530,10 +287,8 @@ export async function runFullVideoGeneration(
     }
   }
 
-  if (hitIpLimit || lastError.includes("638") || /limit|quota|rate/i.test(lastError)) {
-    throw new RateLimitError(
-      "FaceAI IP/rate limit after retries. Add working proxies via PROXY_LIST in Vercel env, then redeploy."
-    );
+  if (/rate|limit|quota|credit/i.test(lastError)) {
+    throw new RateLimitError(lastError);
   }
   throw new Error(lastError);
 }

@@ -47,7 +47,7 @@ export async function POST(request: Request) {
       prompt,
       aspectRatio,
       image,
-      logPrefix: "[faceai-i2v]",
+      logPrefix: "[neon-i2v]",
     });
 
     return NextResponse.json({ id, videoUrl });

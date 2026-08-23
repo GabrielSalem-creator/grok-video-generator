@@ -20,12 +20,12 @@ export async function POST(request: Request) {
     const { id, videoUrl } = await runFullVideoGeneration({
       prompt: prompt.trim(),
       aspectRatio,
-      logPrefix: "[faceai]",
+      logPrefix: "[neon]",
     });
 
     return NextResponse.json({ id, videoUrl });
   } catch (error) {
-    console.error("Error creating video:", error);
+    console.error("Error creating video (neon):", error);
     if (error instanceof RateLimitError) {
       return NextResponse.json({ error: error.message }, { status: 429 });
     }
